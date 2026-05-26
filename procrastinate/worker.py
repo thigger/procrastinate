@@ -654,6 +654,8 @@ class AdjustableWorker(Worker):
         buffer: int = 0,
         **kwargs: Any,
     ):
+        if buffer < 0:
+            raise ValueError("Buffer must be >= 0")
         super().__init__(**kwargs)
         self.buffer = buffer
         self.total_capacity = self.concurrency + buffer
@@ -681,6 +683,12 @@ class AdjustableWorker(Worker):
         if new_concurrency > old_concurrency:
             # Scale up: release buffer slots one at a time, decrementing counter
             slots_to_release = old_buffer - new_buffer
+            # Guard against releasing more slots than actually held.
+            # If set_concurrency is called before _run_loop, _held_buffer_slots is 0,
+            # so slots_to_release becomes 0 and the loop below never runs.
+            # This also avoids releasing on the parent-init semaphore (capacity=concurrency)
+            # before _run_loop replaces it with the correct one (capacity=total_capacity).
+            slots_to_release = min(slots_to_release, self._held_buffer_slots)
             for _ in range(slots_to_release):
                 self._job_semaphore.release()
                 self._held_buffer_slots -= 1
@@ -689,6 +697,11 @@ class AdjustableWorker(Worker):
             # The fetch loop will naturally hold more slots as buffer
             # on the next acquisitions (since _held_buffer_slots < new_buffer).
             pass
+
+        self.logger.info(
+            f"Concurrency adjusted: {old_concurrency} -> {new_concurrency} "
+            f"(buffer: {old_buffer} -> {self.total_capacity - new_concurrency})"
+        )
 
         self.buffer = new_buffer
 
