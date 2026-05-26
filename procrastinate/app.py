@@ -342,6 +342,53 @@ class App(blueprints.Blueprint):
 
         asyncio.run(f())
 
+    async def run_adjustable_worker_async(
+        self,
+        *,
+        buffer: int = 0,
+        **kwargs: Unpack[WorkerOptions],
+    ) -> worker.AdjustableWorker:
+        """
+        Run a worker with adjustable concurrency as an asyncio task.
+
+        Returns the worker instance immediately, allowing concurrency to be
+        adjusted at runtime via ``worker.set_concurrency()``.
+
+        Parameters
+        ----------
+        buffer :
+            Number of buffered semaphore slots for future scaling.
+            Total semaphore capacity will be concurrency + buffer.
+        install_signal_handlers :
+            Defaults to ``False`` for this method since the worker
+            runs as a task inside a larger application.
+
+        Returns
+        -------
+        AdjustableWorker
+            The worker instance. Call ``worker.stop()`` for graceful shutdown.
+            The worker runs as ``worker.run_task`` which you can await or cancel.
+        """
+        self.perform_import_paths()
+
+        # Default to no signal handlers for embedded worker
+        if "install_signal_handlers" not in kwargs:
+            kwargs["install_signal_handlers"] = False
+
+        # Merge worker_defaults with kwargs
+        final_kwargs: WorkerOptions = {**self.worker_defaults, **kwargs}
+
+        adjustable_worker = worker.AdjustableWorker(
+            app=self,
+            buffer=buffer,
+            **final_kwargs,
+        )
+        adjustable_worker.run_task = asyncio.create_task(
+            adjustable_worker.run(),
+            name="adjustable-worker",
+        )
+        return adjustable_worker
+
     async def check_connection_async(self) -> bool:
         return await self.job_manager.check_connection_async()
 

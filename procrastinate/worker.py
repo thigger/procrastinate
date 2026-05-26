@@ -631,3 +631,202 @@ class Worker:
             if not side_tasks_monitor.done():
                 side_tasks_monitor.cancel()
             await self._shutdown(side_tasks=side_tasks)
+
+
+class AdjustableWorker(Worker):
+    """
+    A worker that supports dynamic concurrency adjustment at runtime.
+
+    Starts with a given concurrency and buffer. The total semaphore capacity
+    is concurrency + buffer. The buffer represents reserved capacity that can
+    be converted to active concurrency at any time.
+
+    Parameters
+    ----------
+    buffer :
+        Number of buffered semaphore slots. These are held by the worker loop
+        and can be released to increase active concurrency without restarting.
+    """
+
+    def __init__(
+        self,
+        *,
+        buffer: int = 0,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self.buffer = buffer
+        self.total_capacity = self.concurrency + buffer
+        self._held_buffer_slots = 0
+
+    def set_concurrency(self, new_concurrency: int) -> None:
+        """
+        Adjust the active concurrency at runtime.
+
+        Parameters
+        ----------
+        new_concurrency :
+            New concurrency level. Must be between 0 and total_capacity.
+        """
+        if new_concurrency < 0 or new_concurrency > self.total_capacity:
+            raise ValueError(
+                f"Concurrency must be between 0 and {self.total_capacity}"
+            )
+
+        old_concurrency = self.concurrency
+        old_buffer = self.buffer
+        self.concurrency = new_concurrency
+        new_buffer = self.total_capacity - new_concurrency
+
+        if new_concurrency > old_concurrency:
+            # Scale up: release buffer slots one at a time, decrementing counter
+            slots_to_release = old_buffer - new_buffer
+            for _ in range(slots_to_release):
+                self._job_semaphore.release()
+                self._held_buffer_slots -= 1
+        elif new_concurrency < old_concurrency:
+            # Scale down: no immediate action needed.
+            # The fetch loop will naturally hold more slots as buffer
+            # on the next acquisitions (since _held_buffer_slots < new_buffer).
+            pass
+
+        self.buffer = new_buffer
+
+    async def _run_loop(self) -> None:
+        """
+        Override to:
+        1. Create semaphore with total_capacity instead of concurrency
+        2. Hold initial buffer slots before fetching jobs
+        3. Reset held buffer counter
+        """
+        self.logger.info(
+            f"Starting worker on {utils.queues_display(self.queues)}",
+            extra=self._log_extra(
+                action="start_worker", context=None, queues=self.queues, job_result=None
+            ),
+        )
+        self._new_job_event.clear()
+        self._stop_event.clear()
+        self._running_jobs = {}
+        # Semaphore size is total_capacity, not concurrency
+        self._job_semaphore = asyncio.Semaphore(self.total_capacity)
+        side_tasks = self._start_side_tasks()
+        side_tasks_monitor = asyncio.create_task(
+            self._monitor_side_tasks(side_tasks), name="side_tasks_monitor"
+        )
+
+        context = (
+            signals.on_stop(self.stop)
+            if self.install_signal_handlers
+            else contextlib.nullcontext()
+        )
+
+        try:
+            with context:
+                # Hold initial buffer slots before first fetch
+                self._held_buffer_slots = 0
+                for _ in range(self.buffer):
+                    await self._job_semaphore.acquire()
+                    self._held_buffer_slots += 1
+
+                await self._fetch_and_process_jobs()
+                if not self.wait:
+                    self.logger.info(
+                        "No job found. Stopping worker because wait=False",
+                        extra=self._log_extra(
+                            context=None,
+                            action="stop_worker",
+                            queues=self.queues,
+                            job_result=None,
+                        ),
+                    )
+                    self._stop_event.set()
+
+                while not self._stop_event.is_set():
+                    await utils.wait_any(
+                        self._new_job_event.wait(),
+                        asyncio.sleep(self.fetch_job_polling_interval),
+                        self._stop_event.wait(),
+                    )
+                    await self._fetch_and_process_jobs()
+        finally:
+            if not side_tasks_monitor.done():
+                side_tasks_monitor.cancel()
+            await self._shutdown(side_tasks=side_tasks)
+
+    async def _fetch_and_process_jobs(self) -> None:
+        """
+        Override to handle buffer slot logic.
+
+        After acquiring the semaphore, check if this slot should be held as buffer
+        (when _held_buffer_slots < buffer). If so, increment the counter and loop
+        back without fetching a job - the semaphore stays acquired.
+
+        When _held_buffer_slots >= buffer, proceed to fetch and process a job as normal.
+        """
+        while not self._stop_event.is_set():
+            # Acquire semaphore (with stop event check)
+            acquire_sem_task = asyncio.create_task(self._job_semaphore.acquire())
+            try:
+                await utils.wait_any(acquire_sem_task, self._stop_event.wait())
+            finally:
+                if not acquire_sem_task.done():
+                    # We were stopped before acquiring - clean up
+                    acquire_sem_task.cancel()
+                    try:
+                        await acquire_sem_task
+                    except asyncio.CancelledError:
+                        pass
+                    return
+
+            if self._stop_event.is_set():
+                # Release the semaphore since we're stopping
+                self._job_semaphore.release()
+                break
+
+            self._new_job_event.clear()
+
+            # Check if this slot should be held as buffer
+            if self._held_buffer_slots < self.buffer:
+                # Hold this slot as buffer - increment counter and loop back
+                # The semaphore stays acquired, effectively reducing active concurrency
+                self._held_buffer_slots += 1
+                continue
+
+            # Normal path: fetch and process a job
+            assert self.worker_id is not None
+            job = await self.app.job_manager.fetch_job(
+                queues=self.queues, worker_id=self.worker_id
+            )
+
+            if not job:
+                # No job found - release semaphore and break
+                self._job_semaphore.release()
+                break
+
+            job_id = job.id
+
+            context = job_context.JobContext(
+                app=self.app,
+                worker_name=self.worker_name,
+                worker_queues=self.queues,
+                additional_context=self.additional_context.copy()
+                if self.additional_context
+                else {},
+                job=job,
+                abort_reason=lambda: (
+                    self._job_ids_to_abort.get(job_id) if job_id else None
+                ),
+                start_timestamp=time.time(),
+            )
+            job_task = asyncio.create_task(
+                self._process_job(context),
+                name=f"process job {job.task_name}[{job.id}]",
+            )
+            self._running_jobs[job_task] = context
+
+            def on_job_complete(task: asyncio.Task) -> None:
+                del self._running_jobs[task]
+                self._job_semaphore.release()
+
+            job_task.add_done_callback(on_job_complete)
