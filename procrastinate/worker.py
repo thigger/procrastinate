@@ -631,8 +631,22 @@ class Worker:
         """
         Gracefully shutdown the worker by cancelling side tasks
         and waiting for all pending jobs.
+
+        The heartbeat task is kept alive while jobs are still running to
+        prevent retry_stalled_jobs from incorrectly retrying in-flight jobs.
         """
-        await utils.cancel_and_capture_errors(side_tasks)
+        # Separate heartbeat task from other side tasks by name
+        heartbeat_task = None
+        other_side_tasks = []
+        for task in side_tasks:
+            if task.get_name() == "update_heartbeats":
+                heartbeat_task = task
+            else:
+                other_side_tasks.append(task)
+
+        # Cancel non-heartbeat side tasks immediately
+        if other_side_tasks:
+            await utils.cancel_and_capture_errors(other_side_tasks)
 
         now = time.time()
         for context in self._running_jobs.values():
@@ -663,6 +677,10 @@ class Worker:
                 ),
             )
             await self._abort_running_jobs()
+
+        # Now cancel the heartbeat task — jobs are done
+        if heartbeat_task:
+            await utils.cancel_and_capture_errors([heartbeat_task])
 
         assert self.worker_id is not None
         await self.app.job_manager.unregister_worker(self.worker_id)
