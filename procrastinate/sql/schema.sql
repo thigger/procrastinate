@@ -222,28 +222,31 @@ BEGIN
             FROM procrastinate_jobs AS jobs
             WHERE
                 -- reject the job if its lock has earlier or higher priority jobs
-                NOT EXISTS (
-                    SELECT 1
-                        FROM procrastinate_jobs AS other_jobs
-                        WHERE
-                            jobs.lock IS NOT NULL
-                            AND other_jobs.lock = jobs.lock
-                            AND (
-                                -- job with same lock is already running
-                                other_jobs.status = 'doing'
-                                OR
-                                -- job with same lock is waiting and has higher priority (or same priority but was queued first)
-                                (
-                                    other_jobs.status = 'todo'
-                                    AND (
-                                        other_jobs.priority > jobs.priority
-                                        OR (
-                                        other_jobs.priority = jobs.priority
-                                        AND other_jobs.id < jobs.id
+                -- (NULL locks short-circuit to avoid an O(N^2) anti-join over a large NULL-lock backlog)
+                (
+                    jobs.lock IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                            FROM procrastinate_jobs AS other_jobs
+                            WHERE
+                                other_jobs.lock = jobs.lock
+                                AND (
+                                    -- job with same lock is already running
+                                    other_jobs.status = 'doing'
+                                    OR
+                                    -- job with same lock is waiting and has higher priority (or same priority but was queued first)
+                                    (
+                                        other_jobs.status = 'todo'
+                                        AND (
+                                            other_jobs.priority > jobs.priority
+                                            OR (
+                                            other_jobs.priority = jobs.priority
+                                            AND other_jobs.id < jobs.id
+                                            )
                                         )
                                     )
                                 )
-                            )
+                    )
                 )
                 AND jobs.status = 'todo'
                 AND (target_queue_names IS NULL OR jobs.queue_name = ANY( target_queue_names ))
